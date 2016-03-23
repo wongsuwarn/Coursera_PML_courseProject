@@ -1,0 +1,235 @@
+---
+title: "Coursera Practical Machine Learning Course Project"
+author: "Simon Wongsuwarn"
+date: "22 March 2016"
+output: html_document
+---
+
+```{r warning=FALSE, message=FALSE}
+library(gridExtra)
+library(caret)
+library(plyr)
+library(dplyr)
+library(C50)
+library(randomForest)
+library(survival)
+```
+
+I begin by reading the training and final testing data:
+
+```{r warning=FALSE}
+dat <- read.csv("~/Downloads/pml-training.csv", 
+                row.names = 'X', stringsAsFactors=FALSE)
+final_testing <- read.csv("~/Downloads/pml-testing.csv", 
+                    row.names = 'X', stringsAsFactors=FALSE)
+```
+
+As suggested in a [flowingdata.com post](https://flowingdata.com/2015/02/18/loading-data-and-basic-formatting-in-r/) 
+I set the parameter `stringsAsFactors` to `FALSE`.
+
+I explore the dataset:
+
+```{r eval=FALSE}
+head(dat)
+str(dat$classe)
+```
+
+The response variable should be a factor variable:
+
+```{r warning=FALSE}
+dat$classe <- as.factor(dat$classe)
+```
+
+Many numeric feature vectors have also been read as character vectors so I
+correct that with the help of a [stackoverflow_post](http://stackoverflow.com/questions/27528907/how-to-convert-data-frame-column-from-factor-to-numeric
+):
+
+```{r warning=FALSE}
+indx <- sapply(dat, is.character)
+dat[indx] <- lapply(dat[indx], function(x) as.numeric(x))
+```
+
+I check a response variable historgram to spot any rarely occurring outcomes
+that would potentially be problematic and there are none:
+
+```{r warning=FALSE}
+plot(dat$classe,xlab="Classe", ylab="Frequency",main="Response variable histogram")
+```
+
+I create a subset that removes six variables from the data that I do not want 
+to use as features. The `user_name` variable is removed as I don't want the
+model to rely on any particular user performing the exercise. I also don't 
+want the model to rely on the exercise being performed at any particular time or
+relative time interval (say, if the user's performed the exercises in sequence)
+so the timestamp features are removed. Finally, the `num_window` and 
+`new_window` features are removed as they appear to correspond to the 
+recording software and not the exercise itself:
+
+```{r warning=FALSE}
+dat_subset <- subset(dat,select = 
+                      -c(user_name,
+                         raw_timestamp_part_1,
+                         raw_timestamp_part_2,
+                         cvtd_timestamp, num_window, new_window))
+```
+
+The dataset is many times larger than the `Wage` dataset (`ISLR` library) 
+used in the course. I therefore believe that the current Weight Lifting
+exercises dataset constitutes a "large sample size"" and follow the sample 
+division guidelines as per the course:
+
+```{r warning=FALSE}
+inBuild <- createDataPartition(y=dat_subset$classe,p=0.8,list=FALSE)
+validation <- dat_subset[-inBuild,] # 20% of data for validation
+buildData <- dat_subset[inBuild,]
+inTrain <- createDataPartition(y=buildData$classe,p=6/8,list=FALSE)
+training = buildData[inTrain,] # 60% of data for training
+testing = buildData[-inTrain,] # 20% of data for testing
+```
+
+I create subsets for the training, testing and validation samples where 
+variables with near zero variability are thrown out:
+
+```{r warning=FALSE}
+nzvCheck <- nearZeroVar(training, saveMetrics=TRUE)
+nzvCheck$feature <- row.names(nzvCheck) 
+fzvFeatures <- nzvCheck %>% filter(nzv==FALSE) %>% select(feature)
+
+training_nzvRemoved <- subset(training,select=fzvFeatures[,1])
+testing_nzvRemoved <- subset(testing,select=fzvFeatures[,1])
+validation_nzvRemoved <- subset(validation,select=fzvFeatures[,1])
+```
+
+I visualise the first eight features with density plots:
+
+```{r warning=FALSE, echo = FALSE}
+p1 <- qplot(roll_belt,colour=classe,data=training_nzvRemoved,geom="density")
+p2 <- qplot(pitch_belt,colour=classe,data=training_nzvRemoved,geom="density")
+p3 <- qplot(yaw_belt,colour=classe,data=training_nzvRemoved,geom="density")
+p4 <- qplot(total_accel_belt,colour=classe,data=training_nzvRemoved,geom="density")
+p5 <- qplot(kurtosis_roll_belt,colour=classe,data=training_nzvRemoved,geom="density")
+p6 <- qplot(kurtosis_picth_belt,colour=classe,data=training_nzvRemoved,geom="density")
+p7 <- qplot(skewness_roll_belt,colour=classe,data=training_nzvRemoved,geom="density")
+p8 <- qplot(skewness_roll_belt.1,colour=classe,data=training_nzvRemoved,geom="density")
+
+grid.arrange(p1,p2,p3,p4,p5,p6,p7,p8,ncol=2)
+```
+
+I see many non-Gaussian feature distributions. Further, many features have zero 
+and/or negative values. For these reasons we cannot perform a simple 
+transformation e.g. `BoxCox`. Instead, it is better to pursue scale-invariant
+methods such as random forest or stochastic gradient boosting.
+
+I use `medianImpute` to impute missing data:
+
+```{r warning=FALSE}
+preObj <- preProcess(subset(training_nzvRemoved,select=-classe),method="medianImpute")
+training_impd <- predict(preObj,subset(training_nzvRemoved,select=-classe))
+
+postObj <- preProcess(subset(testing_nzvRemoved,select=-classe),method="medianImpute")
+testing_impd <- predict(postObj,subset(testing_nzvRemoved,select=-classe))
+
+valObj <- preProcess(subset(validation_nzvRemoved,select=-classe),method="medianImpute")
+validation_impd <- predict(valObj,subset(validation_nzvRemoved,select=-classe))
+```
+
+The three models constructed and tuned are Random Forests (RF), Stochastic 
+Gradient Boosting (GBM), and Boosted C5.0 (C50). Cross-validation (CV) is a type of resampling method which involves repeatedly splitting the sample training data into an in-sample training set and an in-sample testing set, and using each repeat to assess the model. `k-fold CV` refers to a type of CV where the sample training data is randomly split into `k` groups of approximately equal size. Each group is used once as the in-sample testing set.  
+
+Here, each model is automatically tuned and is evaluated using 5-fold cross 
+validation using the `trainControl` method found in the `caret` package:
+
+```{r warning=FALSE}
+## 5-fold CV
+fitControl <- trainControl(method = "cv", number = 5)
+```
+
+**Note**: *My machine has a 1.3 GHz Intel Core M processor which means that 
+processing time is a problem. For this reason I only used 5-fold CV instead of
+10-fold and I didn't use repeats during training. I would have otherwise 
+introduced the `repeats` parameter into the `trainControl` function as well.*
+
+I also set the random number seed before each training to ensure that the same 
+data partitions (this would also have ensured the same repeats, had I run with
+repeats on a machine with a faster processor). I pass the `Kappa` argument to
+the metric parameter as my response factors are not balanced (histogram above):
+
+```{r warning=FALSE, error = FALSE, message=FALSE}
+# train the RF model
+# limit mtry = 63 to save processing time as I'd previously run a full grid
+# and a value of 63 was optimum)
+mtryGrid <- expand.grid(mtry = 63)
+set.seed(7)
+rfFit<- train(training$classe ~ ., data = training_impd, method = "rf",
+              do.trace=FALSE, trControl = fitControl, metric = "Kappa",
+              tuneGrid = mtryGrid)
+
+# train the GBM model
+set.seed(7)
+gbmFit <- train(training$classe ~ ., data = training_impd, method = "gbm",
+                 metric = "Kappa", trControl = fitControl, verbose = FALSE)
+
+# train the C50 model
+set.seed(7)
+c50Fit <- train(training_nzvRemoved$classe ~ ., data = training_impd,
+                trControl=fitControl, method="C5.0", verbose=FALSE,
+                metric = "Kappa")
+```
+
+Now we can compare the `Kappa` distributions between the models (each model has
+5 results following 5-fold cross validation):
+
+```{r warning=FALSE}
+cvValues <- resamples(list(GBM = gbmFit, RF = rfFit, C5.0 = c50Fit))
+bwplot(cvValues)
+```
+
+**Note**: *With a more powerful processor I would have tuned the parameters further (e.g.
+the `mTry` parameter for GBM, the `interaction.depth` parameter for RF, the `splits` parameter for C5.0). The testing set would have come in handy for this tuning
+as I still have the validation set held out and untested.*
+
+We see that the Boosted C5.0 and Random Forest models are comparable, and both appear to have performed better than the Stochastic Gradient Boosting model.
+
+Let's see how they perform on the test data:
+
+```{r warning=FALSE}
+confusionMatrix(testing$classe,predict(rfFit,testing_impd))
+# # RF model out of sample Kappa: 0.99
+confusionMatrix(testing$classe,predict(gbmFit,testing_impd))
+# # GBM model out of sample Kappa: 0.96
+confusionMatrix(testing$classe,predict(c50Fit,testing_impd))
+# C5.0 model out of sample Kappa: 0.99
+```
+
+The same relative conclusions between models can be drawn from the out of 
+sample error as previously concluded from the in sample error. Further, the
+absolute values of Accuracy and Kappa are very similar suggesting that the 
+model has not overfitted the training data.
+
+The best performing algorithm is the Boosted C5.0. I end by training the 
+model on the previously unused validation dataset in order to obtain a final
+out of sample error:
+
+```{r warning=FALSE}
+confusionMatrix(testing$classe,predict(c50Fit,validation_impd))
+# C5.0 model out of sample Kappa: 0.99
+```
+
+The expected out of sample Kappa is 0.99.
+
+In order to complete the project quiz, I use the best performing algorithm to
+predict the classes on the [20 test cases dataset](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv).
+
+```{r warning=FALSE, error=FALSE}
+final_testing_subset <- subset(final_testing,select = -c(user_name,
+                         raw_timestamp_part_1, raw_timestamp_part_2,
+                         cvtd_timestamp, num_window, new_window))
+
+# do not select problem_id feature
+final_testing_nzvRemoved <- subset(final_testing_subset,select=filter(fzvFeatures,feature!="classe")$feature)
+pp <- preProcess(final_testing_nzvRemoved,method="medianImpute")
+final_testing_nzvRemoved_impd <- predict(preObj,final_testing_nzvRemoved)
+predict(c50Fit,newdata=final_testing_nzvRemoved_impd)
+```
+
+The data for this project came from this [source](http://groupware.les.inf.puc-rio.br/har).
